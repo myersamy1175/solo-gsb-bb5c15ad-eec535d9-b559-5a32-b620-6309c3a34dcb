@@ -1,0 +1,23 @@
+{
+  "name": "loop-seam-finder",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "音频无缝循环接缝查找工具（浏览器本地处理）",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "~5.5.3",
+    "vite": "^5.4.8"
+  }
+}
