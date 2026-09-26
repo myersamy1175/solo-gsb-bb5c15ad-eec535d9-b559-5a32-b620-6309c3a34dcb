@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Waveform, type Region, type SeamMarker } from './components/Waveform';
 import { SeamSpectrumPanel } from './components/SeamSpectrumPanel';
+import { MonoCompatPanel, type MonoCompatPlayTarget } from './components/MonoCompatPanel';
 import { LoopPlayer } from './audio/player';
 import { decodeAudioFile } from './audio/decode';
 import { findCandidateSeams, type SeamResult } from './audio/loopFinder';
@@ -8,6 +9,8 @@ import { detectPeriods, type PeriodCandidate, type PeriodDetectFailure } from '.
 import { buildLoopPcm } from './audio/loopBuffer';
 import { analyzeSeamSpectrum } from './audio/seamSpectrum';
 import { encodeWav, wavFileSize } from './audio/wavExport';
+import type { MonoCompatInterval, MonoCompatResult } from './audio/monoCompatibility';
+import type { MonoCompatWorkerResponse } from './workers/monoCompatWorker';
 import type { RepeatDetectResult, RepeatMatch } from './audio/repeatDetect';
 import type { RepeatWorkerResponse } from './workers/repeatWorker';
 import { fmtBytes, fmtTime } from './utils/format';
@@ -25,6 +28,11 @@ const REPEAT_MIN_SIMILARITY = 0.9;
 const REPEAT_MIN_SEGMENT_SEC = 0.5;
 /** 重复片段发现：最多列出的组数 */
 const MAX_REPEAT_GROUPS = 5;
+/** 立体声/单声道兼容性检查：检查窗（ms）、步长（ms）、安静窗阈值（dBFS）、风险损失阈值（dB） */
+const MONO_COMPAT_WINDOW_MS = 100;
+const MONO_COMPAT_HOP_MS = 50;
+const MONO_COMPAT_QUIET_DBFS = -50;
+const MONO_COMPAT_RISK_LOSS_DB = -6;
 
 /** 保留 decimals 位小数的有限数值（防御 NaN / Infinity 进入 JSON） */
 const roundTo = (x: number, decimals: number): number => {
@@ -33,7 +41,7 @@ const roundTo = (x: number, decimals: number): number => {
   return Math.round(x * p) / p;
 };
 
-type PlayTarget = 'original' | 'optimized';
+type PlayTarget = 'original' | 'optimized' | 'compat-stereo' | 'compat-mono';
 
 export default function App() {
   const [fileName, setFileName] = useState('');
@@ -57,10 +65,16 @@ export default function App() {
   const [repeatResult, setRepeatResult] = useState<RepeatDetectResult | null>(null);
   const [repeatBusy, setRepeatBusy] = useState(false);
   const [appliedRepeatIdx, setAppliedRepeatIdx] = useState<number | null>(null);
+  // 立体声/单声道兼容性检查：后台 Worker 结果、分析中标记、已载入选区的风险区间序号
+  const [compatResult, setCompatResult] = useState<MonoCompatResult | null>(null);
+  const [compatBusy, setCompatBusy] = useState(false);
+  const [appliedCompatIdx, setAppliedCompatIdx] = useState<number | null>(null);
   const playerRef = useRef<LoopPlayer | null>(null);
   const repeatWorkerRef = useRef<Worker | null>(null);
   // 分析请求令牌：换文件 / 重新分析时使过期的 Worker 回包失效
   const repeatTokenRef = useRef(0);
+  const compatWorkerRef = useRef<Worker | null>(null);
+  const compatTokenRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 当前选中的候选接缝：「试听选中候选」与 JSON / WAV 导出的目标
@@ -92,8 +106,91 @@ export default function App() {
       playerRef.current?.stop();
       repeatWorkerRef.current?.terminate();
       repeatWorkerRef.current = null;
+      compatWorkerRef.current?.terminate();
+      compatWorkerRef.current = null;
     };
   }, []);
+
+  /**
+   * 立体声/单声道兼容性检查：在后台 Worker 逐窗计算左右声道相关度与等权单声道能量损失。
+   * buf 缺省为当前已加载缓冲（换文件后自动分析时显式传入新缓冲，避免闭包读到旧值）。
+   */
+  const runMonoCompat = useCallback((buf?: AudioBuffer, baseStatus?: string) => {
+    const target = buf ?? buffer;
+    if (!target) return;
+    if (target.numberOfChannels !== 2) return;
+    if (!compatWorkerRef.current) {
+      compatWorkerRef.current = new Worker(
+        new URL('./workers/monoCompatWorker.ts', import.meta.url),
+        { type: 'module' },
+      );
+    }
+    const worker = compatWorkerRef.current;
+    const token = ++compatTokenRef.current;
+    const sr = target.sampleRate;
+    // 复制声道数据并转移所有权（不能转移 AudioBuffer 内部数组，否则波形 / 试听失效）
+    const channels: Float32Array[] = [];
+    for (let c = 0; c < target.numberOfChannels; c++) {
+      channels.push(target.getChannelData(c).slice());
+    }
+    setCompatBusy(true);
+    setStatus(
+      (baseStatus ? `${baseStatus} ` : '') +
+        '立体声/单声道兼容性检查：后台线程按 100 ms 窗、50 ms 步长计算声道相关度与等权单声道能量损失…',
+    );
+    worker.onmessage = (e: MessageEvent<MonoCompatWorkerResponse>) => {
+      if (token !== compatTokenRef.current) return; // 已换文件或重新分析，丢弃过期结果
+      setCompatBusy(false);
+      const msg = e.data;
+      if (msg.type === 'error') {
+        setStatus(`立体声/单声道兼容性检查失败：${msg.message}。可点击「重新检查」重试。`);
+        return;
+      }
+      const res = msg.result;
+      setCompatResult(res);
+      setAppliedCompatIdx(null);
+      if (res.failure === 'too-short') {
+        setStatus('立体声/单声道兼容性检查：音频短于一个检查窗（100 ms），无法分析。');
+        return;
+      }
+      const n = res.intervals.length;
+      if (n === 0) {
+        setStatus(
+          `立体声/单声道兼容性检查完成：${res.totalWindows} 个检查窗（安静窗 ${res.quietWindows} 个不参与判定），` +
+            `未发现连续损失达到 ${Math.abs(MONO_COMPAT_RISK_LOSS_DB)} dB 的风险区间，单声道兼容性良好。`,
+        );
+      } else {
+        const worst = res.intervals.reduce(
+          (acc, iv) => (iv.maxLossDb < acc.maxLossDb ? iv : acc),
+          res.intervals[0],
+        );
+        setStatus(
+          `立体声/单声道兼容性检查完成：发现 ${n} 个风险区间（${res.totalWindows} 窗，` +
+            `安静窗 ${res.quietWindows} 个不参与判定），最大损失 ${worst.maxLossDb.toFixed(2)} dB、` +
+            `最差相关度 ${worst.worstCorrelation.toFixed(2)} @ ${fmtTime(worst.startSec)}。` +
+            ` 点击区间可载入选区并 A/B 试听原立体声与等权单声道。`,
+        );
+      }
+    };
+    worker.onerror = () => {
+      if (token !== compatTokenRef.current) return;
+      setCompatBusy(false);
+      setStatus('立体声/单声道兼容性检查失败：后台线程异常终止。可点击「重新检查」重试。');
+    };
+    worker.postMessage(
+      {
+        sampleRate: sr,
+        channels,
+        options: {
+          windowSec: MONO_COMPAT_WINDOW_MS / 1000,
+          hopSec: MONO_COMPAT_HOP_MS / 1000,
+          quietDbfs: MONO_COMPAT_QUIET_DBFS,
+          riskLossDb: MONO_COMPAT_RISK_LOSS_DB,
+        },
+      },
+      channels.map((c) => c.buffer),
+    );
+  }, [buffer]);
 
   const handleFile = useCallback(async (file: File) => {
     setBusy(true);
@@ -119,15 +216,29 @@ export default function App() {
       setRepeatResult(null);
       setRepeatBusy(false);
       setAppliedRepeatIdx(null);
-      setStatus(
-        `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。请在波形上框选大致循环区间。`,
-      );
+      // 换文件时清除旧的兼容性检查结果：终止进行中的分析并使过期回包失效
+      compatTokenRef.current++;
+      compatWorkerRef.current?.terminate();
+      compatWorkerRef.current = null;
+      setCompatResult(null);
+      setCompatBusy(false);
+      setAppliedCompatIdx(null);
+      const loaded = `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。`;
+      if (buf.numberOfChannels === 2) {
+        // 双声道：自动在后台执行兼容性检查
+        runMonoCompat(buf, loaded);
+      } else {
+        setStatus(
+          `${loaded} 当前为${buf.numberOfChannels === 1 ? '单声道' : `${buf.numberOfChannels} 声道`}文件，` +
+            '立体声/单声道兼容性检查不适用。请在波形上框选大致循环区间。',
+        );
+      }
     } catch {
       setStatus('解码失败：请使用 WAV / MP3 等浏览器支持的音频格式。');
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [runMonoCompat]);
 
   const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -153,6 +264,8 @@ export default function App() {
       setPeriodFailure(null);
       // 手动改动选区后，「已载入选区」的重复片段标记随之失效
       setAppliedRepeatIdx(null);
+      // 兼容性检查载入选区的风险区间标记同样失效
+      setAppliedCompatIdx(null);
       // 手动改变选区长度即解除定长约束（吸附前的选区记录同时作废）
       if (appliedPeriod && buffer) {
         const sr = buffer.sampleRate;
@@ -331,6 +444,59 @@ export default function App() {
     [buffer],
   );
 
+  /** 试听指定风险区间：mode = 'stereo' 为原立体声，'mono' 为等权（L+R)/2 单声道，循环播放 */
+  const playCompatInterval = useCallback(async (iv: MonoCompatInterval, mode: 'compat-stereo' | 'compat-mono') => {
+    if (!buffer) return;
+    const sr = buffer.sampleRate;
+    const s0 = Math.max(0, Math.round(iv.startSample));
+    const e0 = Math.min(buffer.length, Math.round(iv.endSample));
+    if (e0 - s0 < 2) return;
+    let pcm = buildLoopPcm(buffer, s0, e0, 0);
+    if (mode === 'compat-mono') {
+      // 等权合并单声道：与风险判定口径一致 m = (L + R) / 2
+      const n = pcm.channels[0].length;
+      const mono = new Float32Array(n);
+      const ch0 = pcm.channels[0];
+      const ch1 = pcm.channels[1] ?? ch0;
+      for (let i = 0; i < n; i++) mono[i] = (ch0[i] + ch1[i]) * 0.5;
+      pcm = { sampleRate: sr, channels: [mono] };
+    }
+    await getPlayer().play(pcm);
+    setPlaying(mode);
+  }, [buffer]);
+
+  /** 点击风险区间：载入波形选区并清空旧周期与接缝候选（试听模式若在进行则延续到新区间） */
+  const applyCompatInterval = useCallback(
+    async (idx: number) => {
+      if (!buffer || !compatResult) return;
+      const iv = compatResult.intervals[idx];
+      if (!iv) return;
+      const { startSec: start, endSec: end } = iv;
+      // 记录切换前的试听模式：切换区间后无缝续播，便于连续核对
+      const resume: MonoCompatPlayTarget =
+        playing === 'compat-stereo' || playing === 'compat-mono' ? playing : null;
+      setSelection({ start, end });
+      setAppliedCompatIdx(idx);
+      // 选区来源已变：旧接缝候选与周期校准结果一并清空
+      setCandidates([]);
+      setSelectedIdx(0);
+      setPeriodCandidates([]);
+      setPeriodFailure(null);
+      setAppliedPeriod(null);
+      setPreSnapSelection(null);
+      if (resume) {
+        await playCompatInterval(iv, resume);
+      }
+      setStatus(
+        `已载入兼容性风险区间 #${idx + 1} ${fmtTime(start)} ~ ${fmtTime(end)}` +
+          `（时长 ${fmtTime(end - start)}，${iv.windowCount} 个风险窗，` +
+          `最差相关度 ${iv.worstCorrelation.toFixed(2)}，最大损失 ${iv.maxLossDb.toFixed(2)} dB）；` +
+          `可切换试听原立体声与等权单声道核对抵消。`,
+      );
+    },
+    [buffer, compatResult, playing, playCompatInterval],
+  );
+
   /** 搜索半径变化：清空候选并禁用旧导出，需重新查找 */
   const onRadiusChange = (v: number) => {
     setRadiusMs(v);
@@ -448,6 +614,25 @@ export default function App() {
     getPlayer().stop();
     setPlaying(null);
   }, []);
+
+  /** 兼容性检查面板：再点当前模式按钮则停止，否则在已载入区间上切换原立体声 / 等权单声道 */
+  const playCompatMode = useCallback(
+    async (mode: 'compat-stereo' | 'compat-mono') => {
+      if (!compatResult || appliedCompatIdx === null) {
+        setStatus('请先点击一个风险区间将其载入选区，再切换试听。');
+        return;
+      }
+      const iv = compatResult.intervals[appliedCompatIdx];
+      if (!iv) return;
+      if (playing === mode) {
+        getPlayer().stop();
+        setPlaying(null);
+        return;
+      }
+      await playCompatInterval(iv, mode);
+    },
+    [compatResult, appliedCompatIdx, playing, playCompatInterval],
+  );
 
   // 交叉淡化时长变化时，若正在试听优化区间则实时重建并继续播放
   const crossfadeRef = useRef(crossfadeMs);
@@ -577,6 +762,40 @@ export default function App() {
             },
           }
         : null,
+      // 立体声/单声道兼容性检查：参数、窗统计与风险区间；单声道 / 多声道文件 applicable=false
+      monoCompatibility: compatResult
+        ? {
+            applicable: compatResult.applicable,
+            failure: compatResult.failure,
+            parameters: {
+              windowMs: MONO_COMPAT_WINDOW_MS,
+              hopMs: MONO_COMPAT_HOP_MS,
+              windowSamples: compatResult.windowSamples,
+              hopSamples: compatResult.hopSamples,
+              quietThresholdDbfs: MONO_COMPAT_QUIET_DBFS,
+              riskLossDb: MONO_COMPAT_RISK_LOSS_DB,
+              monoMix: 'equal-gain-(L+R)/2',
+            },
+            totalWindows: compatResult.totalWindows,
+            quietWindows: compatResult.quietWindows,
+            riskWindows: compatResult.riskWindows,
+            intervals: compatResult.intervals.map((iv, i) => ({
+              rank: i + 1,
+              startSec: roundTo(iv.startSec, 6),
+              endSec: roundTo(iv.endSec, 6),
+              startSample: iv.startSample,
+              endSample: iv.endSample,
+              durationSec: roundTo(iv.endSec - iv.startSec, 6),
+              windowCount: iv.windowCount,
+              worstCorrelation: roundTo(iv.worstCorrelation, 4),
+              maxLossDb: roundTo(iv.maxLossDb, 2),
+            })),
+          }
+        : {
+            applicable: buffer.numberOfChannels === 2,
+            failure: buffer.numberOfChannels === 2 ? 'not-analyzed' : 'not-stereo',
+            intervals: [],
+          },
       exportedAt: new Date().toISOString(),
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -590,9 +809,10 @@ export default function App() {
       `已导出 JSON：候选 #${selectedIdx + 1} 的起止时间、全部候选列表、搜索参数与接缝频谱诊断` +
         (appliedPeriod ? '，含周期校准（周期、置信度与定长搜索标记）' : '') +
         (repeatResult ? `，含 ${repeatResult.groups.length} 组重复片段` : '') +
+        (compatResult ? `，含 ${compatResult.intervals.length} 个单声道兼容性风险区间` : '') +
         '。',
     );
-  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, appliedPeriod, periodCandidates, fixedLoopSamples, repeatResult]);
+  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, appliedPeriod, periodCandidates, fixedLoopSamples, repeatResult, compatResult]);
 
   const exportWav = useCallback(() => {
     if (!buffer || !seam) return;
@@ -667,6 +887,19 @@ export default function App() {
             <span><i className="swatch swatch-handle" /> 选区边界（可拖动）</span>
             <span><i className="swatch swatch-seam" /> 候选接缝（编号与列表对应，高亮为选中）</span>
           </div>
+
+          <MonoCompatPanel
+            channelCount={buffer.numberOfChannels}
+            result={compatResult}
+            busy={compatBusy}
+            appliedIdx={appliedCompatIdx}
+            playing={playing === 'compat-stereo' || playing === 'compat-mono' ? (playing as MonoCompatPlayTarget) : null}
+            onReanalyze={() => runMonoCompat()}
+            onSelectInterval={(idx) => void applyCompatInterval(idx)}
+            onPlayStereo={() => void playCompatMode('compat-stereo')}
+            onPlayMono={() => void playCompatMode('compat-mono')}
+            onStop={stopPlayback}
+          />
 
           <section className="panel repeats">
             <h2>重复片段发现</h2>

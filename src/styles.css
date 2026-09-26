@@ -346,6 +346,90 @@ button.active {
   background: #2fd27d;
 }
 
+/* 立体声 / 单声道兼容性检查面板 */
+.mono-compat h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.mono-compat-desc {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
+.mono-compat .transport {
+  margin-bottom: 12px;
+}
+
+.mono-compat table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  margin-top: 12px;
+}
+
+.mono-compat th,
+.mono-compat td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #232c40;
+}
+
+.mono-compat th {
+  color: #9aa7bd;
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.mono-compat tbody tr {
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.mono-compat tbody tr:hover {
+  background: rgba(91, 141, 239, 0.08);
+}
+
+.mono-compat tbody tr.selected {
+  background: rgba(47, 210, 125, 0.1);
+}
+
+.mono-compat tbody tr.selected td {
+  color: #7fe6b0;
+}
+
+.mono-compat tbody tr.selected td.compat-bad {
+  color: #ff8d8d;
+}
+
+.mono-compat tr.selected .rank {
+  background: #2fd27d;
+  color: #06251a;
+}
+
+td.compat-bad {
+  color: #ff8d8d;
+  font-variant-numeric: tabular-nums;
+}
+
+.mono-compat-summary {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: #9aa7bd;
+}
+
+.mono-compat-summary b {
+  color: #7fe6b0;
+}
+
+.mono-compat-note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
 /* 接缝频谱检查面板 */
 .spectrum h2 {
   margin: 0 0 8px;
