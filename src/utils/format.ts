@@ -20,3 +20,8 @@ export function fmtTick(sec: number): string {
   const s = Math.floor(sec - m * 60);
   return `${m}:${String(s).padStart(2, '0')}`;
 }
+
+/** 损失 dB → 可读值（如 "6.3 dB"）；完全抵消（Infinity）显示为 "∞ dB" */
+export function fmtLossDb(db: number): string {
+  return Number.isFinite(db) ? `${db.toFixed(1)} dB` : '∞ dB';
+}

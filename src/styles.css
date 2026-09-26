@@ -262,23 +262,26 @@ button.active {
   color: #9aa7bd;
 }
 
-/* 周期校准 / 重复片段发现面板 */
+/* 周期校准 / 重复片段发现 / 兼容性检查面板 */
 .period h2,
-.repeats h2 {
+.repeats h2,
+.compat h2 {
   margin: 0 0 8px;
   font-size: 14px;
   font-weight: 600;
 }
 
 .period-desc,
-.repeats-desc {
+.repeats-desc,
+.compat-desc {
   margin: 0 0 12px;
   font-size: 12px;
   color: #9aa7bd;
 }
 
 .period table,
-.repeats table {
+.repeats table,
+.compat table {
   width: 100%;
   border-collapse: collapse;
   font-size: 14px;
@@ -288,37 +291,44 @@ button.active {
 .period th,
 .period td,
 .repeats th,
-.repeats td {
+.repeats td,
+.compat th,
+.compat td {
   text-align: left;
   padding: 6px 10px;
   border-bottom: 1px solid #232c40;
 }
 
 .period th,
-.repeats th {
+.repeats th,
+.compat th {
   color: #9aa7bd;
   font-weight: 500;
   font-size: 12px;
 }
 
 .period tbody tr,
-.repeats tbody tr {
+.repeats tbody tr,
+.compat tbody tr {
   cursor: pointer;
   transition: background 0.12s;
 }
 
 .period tbody tr:hover,
-.repeats tbody tr:hover {
+.repeats tbody tr:hover,
+.compat tbody tr:hover {
   background: rgba(91, 141, 239, 0.08);
 }
 
 .period tbody tr.selected,
-.repeats tbody tr.selected {
+.repeats tbody tr.selected,
+.compat tbody tr.selected {
   background: rgba(47, 210, 125, 0.1);
 }
 
 .period tbody tr.selected td,
-.repeats tbody tr.selected td {
+.repeats tbody tr.selected td,
+.compat tbody tr.selected td {
   color: #7fe6b0;
 }
 
@@ -344,6 +354,43 @@ button.active {
   display: block;
   height: 100%;
   background: #2fd27d;
+}
+
+/* 立体声/单声道兼容性检查面板 */
+.compat-summary {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: #9aa7bd;
+}
+
+.compat-summary b {
+  color: #e6ebf5;
+}
+
+.compat .transport {
+  margin-top: 12px;
+}
+
+.compat-hint {
+  margin: 8px 2px 0;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
+/* 兼容性检查无风险的正向提示 */
+.ok-note {
+  margin: 0;
+  font-size: 12px;
+  color: #7fe6b0;
+  background: rgba(47, 210, 125, 0.08);
+  border: 1px solid rgba(47, 210, 125, 0.3);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+/* 负相关（反相）数值标红 */
+.neg {
+  color: #ff8f8f;
 }
 
 /* 接缝频谱检查面板 */

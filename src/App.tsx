@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Waveform, type Region, type SeamMarker } from './components/Waveform';
 import { SeamSpectrumPanel } from './components/SeamSpectrumPanel';
+import { MonoCompatPanel, type RiskPlayMode } from './components/MonoCompatPanel';
 import { LoopPlayer } from './audio/player';
 import { decodeAudioFile } from './audio/decode';
 import { findCandidateSeams, type SeamResult } from './audio/loopFinder';
 import { detectPeriods, type PeriodCandidate, type PeriodDetectFailure } from './audio/periodDetect';
 import { buildLoopPcm } from './audio/loopBuffer';
 import { analyzeSeamSpectrum } from './audio/seamSpectrum';
+import { analyzeMonoCompat, buildCompatAuditionPcm, type MonoCompatResult, type MonoCompatRiskInterval } from './audio/monoCompat';
 import { encodeWav, wavFileSize } from './audio/wavExport';
 import type { RepeatDetectResult, RepeatMatch } from './audio/repeatDetect';
 import type { RepeatWorkerResponse } from './workers/repeatWorker';
-import { fmtBytes, fmtTime } from './utils/format';
+import { fmtBytes, fmtLossDb, fmtTime } from './utils/format';
 
 const SLOPE_WINDOW = 32;
 const SLOPE_WEIGHT = 1;
@@ -33,7 +35,7 @@ const roundTo = (x: number, decimals: number): number => {
   return Math.round(x * p) / p;
 };
 
-type PlayTarget = 'original' | 'optimized';
+type PlayTarget = 'original' | 'optimized' | RiskPlayMode;
 
 export default function App() {
   const [fileName, setFileName] = useState('');
@@ -57,6 +59,9 @@ export default function App() {
   const [repeatResult, setRepeatResult] = useState<RepeatDetectResult | null>(null);
   const [repeatBusy, setRepeatBusy] = useState(false);
   const [appliedRepeatIdx, setAppliedRepeatIdx] = useState<number | null>(null);
+  // 立体声/单声道兼容性检查：导入双声道文件后自动分析的结果、已载入选区的风险区间序号
+  const [monoCompat, setMonoCompat] = useState<MonoCompatResult | null>(null);
+  const [appliedRiskIdx, setAppliedRiskIdx] = useState<number | null>(null);
   const playerRef = useRef<LoopPlayer | null>(null);
   const repeatWorkerRef = useRef<Worker | null>(null);
   // 分析请求令牌：换文件 / 重新分析时使过期的 Worker 回包失效
@@ -119,8 +124,21 @@ export default function App() {
       setRepeatResult(null);
       setRepeatBusy(false);
       setAppliedRepeatIdx(null);
+      // 立体声兼容性检查：换文件时清除旧结果；双声道（及以上）导入后立即自动分析，
+      // 单声道置空并由面板显示「不适用」
+      setAppliedRiskIdx(null);
+      const compat = buf.numberOfChannels >= 2 ? analyzeMonoCompat(buf) : null;
+      setMonoCompat(compat);
+      const compatNote =
+        compat === null
+          ? '单声道文件：立体声兼容性检查不适用。'
+          : compat.intervals.length > 0
+            ? `兼容性检查：发现 ${compat.intervals.length} 个单声道合并风险区间（详见下方面板）。`
+            : '兼容性检查：未发现达到 6 dB 合并损失的风险区间。';
       setStatus(
-        `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。请在波形上框选大致循环区间。`,
+        `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。` +
+          compatNote +
+          '请在波形上框选大致循环区间。',
       );
     } catch {
       setStatus('解码失败：请使用 WAV / MP3 等浏览器支持的音频格式。');
@@ -153,6 +171,14 @@ export default function App() {
       setPeriodFailure(null);
       // 手动改动选区后，「已载入选区」的重复片段标记随之失效
       setAppliedRepeatIdx(null);
+      // 风险区间载入标记同样失效；若正在试听风险区间则停止，避免试听内容与选区脱节
+      if (appliedRiskIdx !== null) {
+        setAppliedRiskIdx(null);
+        if (playing === 'risk-stereo' || playing === 'risk-mono') {
+          getPlayer().stop();
+          setPlaying(null);
+        }
+      }
       // 手动改变选区长度即解除定长约束（吸附前的选区记录同时作废）
       if (appliedPeriod && buffer) {
         const sr = buffer.sampleRate;
@@ -164,7 +190,7 @@ export default function App() {
         }
       }
     },
-    [appliedPeriod, buffer],
+    [appliedPeriod, buffer, appliedRiskIdx, playing],
   );
 
   /** 周期校准：分析整段音频的能量变化包络，给出前 3 个周期候选 */
@@ -329,6 +355,43 @@ export default function App() {
       );
     },
     [buffer],
+  );
+
+  /** 点击兼容性风险区间：将其载入波形选区，并清空旧周期与接缝候选（与重复片段载入口径一致） */
+  const applyRiskInterval = useCallback(
+    (iv: MonoCompatRiskInterval, idx: number) => {
+      if (!buffer) return;
+      const sr = buffer.sampleRate;
+      setSelection({ start: iv.startSample / sr, end: iv.endSample / sr });
+      setAppliedRiskIdx(idx);
+      // 选区来源已变：旧接缝候选、周期校准与重复片段载入标记一并清空
+      setCandidates([]);
+      setSelectedIdx(0);
+      setPeriodCandidates([]);
+      setPeriodFailure(null);
+      setAppliedPeriod(null);
+      setPreSnapSelection(null);
+      setAppliedRepeatIdx(null);
+      setStatus(
+        `已载入兼容性风险区间 #${idx + 1}（${fmtTime(iv.startSec)} ~ ${fmtTime(iv.endSec)}，` +
+          `最差相关度 ${iv.worstCorrelation.toFixed(2)}，最大损失 ${fmtLossDb(iv.maxLossDb)}）为当前选区；` +
+          `可切换「试听原立体声 / 试听等权单声道」核对抵消，旧周期与接缝候选已清空。`,
+      );
+    },
+    [buffer],
+  );
+
+  /** 试听已载入的风险区间：原立体声（保留全部声道）/ 等权单声道，循环播放便于核对抵消 */
+  const playRisk = useCallback(
+    async (mode: RiskPlayMode) => {
+      if (!buffer || !monoCompat || appliedRiskIdx === null) return;
+      const iv = monoCompat.intervals[appliedRiskIdx];
+      if (!iv) return;
+      const pcm = buildCompatAuditionPcm(buffer, iv.startSample, iv.endSample, mode === 'risk-mono');
+      await getPlayer().play(pcm);
+      setPlaying(mode);
+    },
+    [buffer, monoCompat, appliedRiskIdx],
   );
 
   /** 搜索半径变化：清空候选并禁用旧导出，需重新查找 */
@@ -545,6 +608,31 @@ export default function App() {
             })),
           }
         : null,
+      // 立体声/单声道兼容性检查：导入双声道文件后自动分析的参数与风险区间；单声道文件为 null
+      monoCompatibility: monoCompat
+        ? {
+            parameters: {
+              windowMs: roundTo((monoCompat.windowSamples / sr) * 1000, 3),
+              hopMs: roundTo((monoCompat.hopSamples / sr) * 1000, 3),
+              silenceThresholdDbfs: monoCompat.silenceDbfs,
+              lossThresholdDb: monoCompat.lossThresholdDb,
+              windowCount: monoCompat.windows.length,
+              quietWindows: monoCompat.quietCount,
+              riskWindows: monoCompat.riskCount,
+            },
+            intervals: monoCompat.intervals.map((iv, i) => ({
+              rank: i + 1,
+              startSec: roundTo(iv.startSec, 6),
+              endSec: roundTo(iv.endSec, 6),
+              startSample: iv.startSample,
+              endSample: iv.endSample,
+              windows: iv.windowCount,
+              worstCorrelation: roundTo(iv.worstCorrelation, 4),
+              // 完全抵消（单声道能量为 0）时损失为 Infinity，序列化为 null
+              maxLossDb: Number.isFinite(iv.maxLossDb) ? roundTo(iv.maxLossDb, 2) : null,
+            })),
+          }
+        : null,
       seamCost: seam.cost,
       // 接缝频谱诊断：参数与结果（差值矩阵为 头 − 尾，帧按与接缝的距离配对）
       spectrumDiagnostics: spectrum
@@ -590,9 +678,10 @@ export default function App() {
       `已导出 JSON：候选 #${selectedIdx + 1} 的起止时间、全部候选列表、搜索参数与接缝频谱诊断` +
         (appliedPeriod ? '，含周期校准（周期、置信度与定长搜索标记）' : '') +
         (repeatResult ? `，含 ${repeatResult.groups.length} 组重复片段` : '') +
+        (monoCompat ? '，含立体声/单声道兼容性检查结果' : '') +
         '。',
     );
-  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, appliedPeriod, periodCandidates, fixedLoopSamples, repeatResult]);
+  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, appliedPeriod, periodCandidates, fixedLoopSamples, repeatResult, monoCompat]);
 
   const exportWav = useCallback(() => {
     if (!buffer || !seam) return;
@@ -636,7 +725,7 @@ export default function App() {
     <div className="app">
       <header className="header">
         <h1>无缝循环接缝查找器</h1>
-        <p>本地浏览器内分析音频：可自动发现整段音频中的重复片段并载入选区，先做周期校准吸附选区终点（定长接缝搜索），在粗选边界附近搜索幅值与短窗斜率最连续的接缝候选（Top 5 按代价排序），可点选对比试听、查看接缝频谱诊断热图并导出参数。</p>
+        <p>本地浏览器内分析音频：导入双声道文件后自动进行立体声/单声道兼容性检查（左右相关度与等权合并能量损失，风险区间可载入选区并切换试听原立体声/等权单声道核对抵消）；可自动发现整段音频中的重复片段并载入选区，先做周期校准吸附选区终点（定长接缝搜索），在粗选边界附近搜索幅值与短窗斜率最连续的接缝候选（Top 5 按代价排序），可点选对比试听、查看接缝频谱诊断热图并导出参数。</p>
       </header>
 
       <section
@@ -729,6 +818,16 @@ export default function App() {
               </table>
             )}
           </section>
+
+          <MonoCompatPanel
+            result={monoCompat}
+            channels={buffer.numberOfChannels}
+            appliedIdx={appliedRiskIdx}
+            playing={playing === 'risk-stereo' || playing === 'risk-mono' ? playing : null}
+            onApplyInterval={applyRiskInterval}
+            onPlay={(mode) => void playRisk(mode)}
+            onStop={stopPlayback}
+          />
 
           <section className="panel period">
             <h2>周期校准</h2>
